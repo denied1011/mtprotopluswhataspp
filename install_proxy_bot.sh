@@ -1,99 +1,60 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -Eeuo pipefail
 
-### ================= CONFIG =================
-MT_PORT=8443
-WA_PORT=443
-BOT_DIR="/opt/tg-proxy-bot"
-SERVICE_FILE="/etc/systemd/system/tg-proxy-bot.service"
 LOG="/var/log/proxy-install.log"
-### ==========================================
-
 exec > >(tee -a "$LOG") 2>&1
 
-### ================= UTILS ==================
-die() { echo "[ERROR] $*" >&2; exit 1; }
-
-step() { echo -e "\n==== $* ===="; }
-
-require_root() {
-  [[ $EUID -eq 0 ]] || die "Run as root"
-}
-
-check_cmd() {
-  command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"
-}
-
-container_running() {
-  docker inspect -f '{{.State.Status}}' "$1" 2>/dev/null | grep -q running
-}
-
 rollback() {
-  echo "[ROLLBACK] Cleaning up"
+  echo "[ROLLBACK] Откат"
   systemctl stop tg-proxy-bot 2>/dev/null || true
   docker rm -f mtproto waproxy 2>/dev/null || true
 }
 trap rollback ERR
-### ==========================================
 
-require_root
+echo "=== НАСТРОЙКА ==="
+read -p "Telegram BOT TOKEN: " BOT_TOKEN
+read -p "Telegram ADMIN ID: " ADMIN_ID
 
-### ================= INPUT ==================
-echo "=== TELEGRAM SETTINGS ==="
-read -rp "BOT TOKEN: " BOT_TOKEN
-read -rp "ADMIN TELEGRAM ID: " ADMIN_ID
-[[ -n "$BOT_TOKEN" && -n "$ADMIN_ID" ]] || die "Token or admin ID missing"
-### ==========================================
+MT_PORT=8443
+WA_PORT=443
 
-### ================= SYSTEM =================
-step "Installing system dependencies"
+step() { echo -e "\n==== $1 ===="; }
+
+check_container() {
+  docker inspect -f '{{.State.Status}}' "$1" 2>/dev/null | grep -q running
+}
+
+step "Установка зависимостей"
 apt update
-apt install -y \
-  ca-certificates curl python3 python3-pip docker.io
+apt install -y curl ca-certificates python3 python3-pip docker.io
 
 systemctl enable docker
 systemctl start docker
-systemctl is-active docker >/dev/null || die "Docker not running"
+systemctl is-active docker
 
-check_cmd docker
-check_cmd curl
-check_cmd python3
-### ==========================================
-
-### ================= PYTHON =================
-step "Installing Python dependencies"
 pip3 install --no-cache-dir python-telegram-bot==20.7 requests
-### ==========================================
 
-### ================= PORTS ==================
-step "Freeing port 443 if needed"
+step "Освобождение порта 443"
 systemctl stop nginx apache2 2>/dev/null || true
-### ==========================================
 
-### ================= IMAGES =================
-step "Pulling Docker images"
+step "Загрузка Docker образов"
 docker pull telegrammessenger/proxy:latest
 docker pull facebook/whatsapp_proxy:latest
-### ==========================================
 
-### ================= MTPROTO =================
-step "Starting MTProto proxy"
-MT_SECRET="$(openssl rand -hex 16)"
-
+step "Запуск MTProto"
+MT_SECRET=$(openssl rand -hex 16)
 docker rm -f mtproto 2>/dev/null || true
 docker run -d \
   --name mtproto \
   --restart unless-stopped \
   -p ${MT_PORT}:443 \
-  -e SECRET="${MT_SECRET}" \
+  -e SECRET=${MT_SECRET} \
   telegrammessenger/proxy:latest
 
-sleep 2
-container_running mtproto || die "MTProto failed to start"
-### ==========================================
+sleep 3
+check_container mtproto || { echo "MTPROTO НЕ ЗАПУСТИЛСЯ"; docker logs mtproto; exit 1; }
 
-### ================= WHATSAPP =================
-step "Starting WhatsApp proxy (official)"
+step "Запуск WhatsApp Proxy"
 docker rm -f waproxy 2>/dev/null || true
 docker run -d \
   --name waproxy \
@@ -101,22 +62,18 @@ docker run -d \
   -p ${WA_PORT}:443 \
   facebook/whatsapp_proxy:latest
 
-sleep 2
-container_running waproxy || die "WhatsApp proxy failed to start"
-### ==========================================
+sleep 3
+check_container waproxy || { echo "WHATSAPP НЕ ЗАПУСТИЛСЯ"; docker logs waproxy; exit 1; }
 
-### ================= TG MENU =================
-step "Setting Telegram chat menu button"
+step "Настройка Telegram Menu Button"
 curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/setChatMenuButton" \
   -H "Content-Type: application/json" \
   -d '{"menu_button":{"type":"commands"}}' >/dev/null
-### ==========================================
 
-### ================= BOT ====================
-step "Installing Telegram bot"
-mkdir -p "$BOT_DIR"
+step "Установка Telegram-бота"
+mkdir -p /opt/tg-proxy-bot
 
-cat > "${BOT_DIR}/bot.py" <<PY
+cat <<EOF >/opt/tg-proxy-bot/bot.py
 import subprocess, time, secrets, requests
 from threading import Thread
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -127,13 +84,12 @@ ADMIN_ID=int("${ADMIN_ID}")
 MT_PORT=${MT_PORT}
 WA_PORT=${WA_PORT}
 
-def sh(cmd): return subprocess.getoutput(cmd)
+def sh(c): return subprocess.getoutput(c)
 
-def notify(msg):
+def notify(t):
     requests.post(
         f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        json={"chat_id": ADMIN_ID, "text": msg},
-        timeout=5
+        json={"chat_id":ADMIN_ID,"text":t}
     )
 
 def ip(): return sh("curl -s https://api.ipify.org")
@@ -146,117 +102,117 @@ def stats(name):
     )
 
 def mt_links(secret):
-    i = ip()
-    return f"tg://proxy?server={i}&port={MT_PORT}&secret={secret}\nhttps://t.me/proxy?server={i}&port={MT_PORT}&secret={secret}"
+    i=ip()
+    return (
+        f"tg://proxy?server={i}&port={MT_PORT}&secret={secret}\n"
+        f"https://t.me/proxy?server={i}&port={MT_PORT}&secret={secret}"
+    )
 
 def wa_link():
     return f"{ip()}:{WA_PORT}"
 
-state = {"mtproto": "running", "waproxy": "running"}
+last={"mtproto":"running","waproxy":"running"}
 
 def monitor():
     while True:
-        for c in state:
-            s = sh(f"docker inspect -f '{{{{.State.Status}}}}' {c} 2>/dev/null")
-            if s != "running" and state[c] == "running":
-                notify(f"🚨 {c} DOWN")
-                state[c] = s
-            if s == "running" and state[c] != "running":
-                notify(f"✅ {c} UP")
-                state[c] = "running"
+        for c in last:
+            s=sh(f"docker inspect -f '{{{{.State.Status}}}}' {c} 2>/dev/null")
+            if s!="running" and last[c]=="running":
+                notify(f"🚨 {c} УПАЛ")
+                last[c]=s
+            if s=="running" and last[c]!="running":
+                notify(f"✅ {c} ВОССТАНОВЛЕН")
+                last[c]="running"
         time.sleep(15)
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID: return
-    kb = [
-        [InlineKeyboardButton("🟦 MTProto", callback_data="mt")],
-        [InlineKeyboardButton("🟩 WhatsApp Proxy", callback_data="wa")]
+async def start(update:Update,context:ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id!=ADMIN_ID: return
+    kb=[
+        [InlineKeyboardButton("🟦 MTProto",callback_data="mt")],
+        [InlineKeyboardButton("🟩 WhatsApp Proxy",callback_data="wa")]
     ]
-    await update.message.reply_text("Proxy Control Panel", reply_markup=InlineKeyboardMarkup(kb))
+    await update.message.reply_text("Proxy Control Panel",reply_markup=InlineKeyboardMarkup(kb))
 
-async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
+async def cb(update:Update,context:ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query
     await q.answer()
-    if q.from_user.id != ADMIN_ID: return
+    if q.from_user.id!=ADMIN_ID: return
 
-    if q.data == "main":
-        return await start(update, context)
+    if q.data=="main":
+        await start(update,context)
 
-    if q.data == "mt":
-        kb = [
-            [InlineKeyboardButton("📊 Status", callback_data="mt_s")],
-            [InlineKeyboardButton("🔗 Links", callback_data="mt_l")],
-            [InlineKeyboardButton("🔑 New secret", callback_data="mt_n")],
-            [InlineKeyboardButton("🔄 Restart", callback_data="mt_r")],
-            [InlineKeyboardButton("⬆️ Update", callback_data="mt_u")],
-            [InlineKeyboardButton("⬅️ Back", callback_data="main")]
+    elif q.data=="mt":
+        kb=[
+            [InlineKeyboardButton("📊 Статус",callback_data="mt_s")],
+            [InlineKeyboardButton("🔗 Ссылки",callback_data="mt_l")],
+            [InlineKeyboardButton("🔑 Новый SECRET",callback_data="mt_n")],
+            [InlineKeyboardButton("🔄 Перезапуск",callback_data="mt_r")],
+            [InlineKeyboardButton("⬆️ Обновить",callback_data="mt_u")],
+            [InlineKeyboardButton("⬅️ Назад",callback_data="main")]
         ]
-        return await q.edit_message_text("MTProto", reply_markup=InlineKeyboardMarkup(kb))
+        await q.edit_message_text("🟦 MTProto",reply_markup=InlineKeyboardMarkup(kb))
 
-    if q.data == "wa":
-        kb = [
-            [InlineKeyboardButton("📊 Status", callback_data="wa_s")],
-            [InlineKeyboardButton("🔗 Link", callback_data="wa_l")],
-            [InlineKeyboardButton("🔄 Restart", callback_data="wa_r")],
-            [InlineKeyboardButton("⬆️ Update", callback_data="wa_u")],
-            [InlineKeyboardButton("⬅️ Back", callback_data="main")]
+    elif q.data=="wa":
+        kb=[
+            [InlineKeyboardButton("📊 Статус",callback_data="wa_s")],
+            [InlineKeyboardButton("🔗 Ссылка",callback_data="wa_l")],
+            [InlineKeyboardButton("🔄 Перезапуск",callback_data="wa_r")],
+            [InlineKeyboardButton("⬆️ Обновить",callback_data="wa_u")],
+            [InlineKeyboardButton("⬅️ Назад",callback_data="main")]
         ]
-        return await q.edit_message_text("WhatsApp Proxy", reply_markup=InlineKeyboardMarkup(kb))
+        await q.edit_message_text("🟩 WhatsApp Proxy",reply_markup=InlineKeyboardMarkup(kb))
 
-    if q.data == "mt_s":
-        s,a,n = stats("mtproto")
-        return await q.edit_message_text(f"MTProto\\n{s}\\n{a}\\n{n}")
+    elif q.data=="mt_s":
+        s,a,n=stats("mtproto")
+        await q.edit_message_text(f"MTProto\\nСтатус:{s}\\nАптайм:{a}\\nТрафик:{n}")
 
-    if q.data == "mt_l":
-        sec = sh("docker inspect mtproto | grep SECRET | cut -d= -f2 | tr -d '[]\" '")
-        return await q.edit_message_text(mt_links(sec))
+    elif q.data=="mt_l":
+        sec=sh("docker inspect mtproto | grep SECRET | head -1 | cut -d= -f2 | tr -d '\"[] '")
+        await q.edit_message_text(mt_links(sec))
 
-    if q.data == "mt_n":
-        sec = secrets.token_hex(16)
+    elif q.data=="mt_n":
+        sec=secrets.token_hex(16)
         sh("docker rm -f mtproto")
         sh(f"docker run -d --name mtproto --restart unless-stopped -p {MT_PORT}:443 -e SECRET={sec} telegrammessenger/proxy:latest")
-        return await q.edit_message_text(mt_links(sec))
+        await q.edit_message_text(mt_links(sec))
 
-    if q.data == "mt_r":
+    elif q.data=="mt_r":
         sh("docker restart mtproto")
-        return await q.edit_message_text("MTProto restarted")
+        await q.edit_message_text("MTProto перезапущен")
 
-    if q.data == "mt_u":
+    elif q.data=="mt_u":
         sh("docker pull telegrammessenger/proxy:latest && docker restart mtproto")
-        return await q.edit_message_text("MTProto updated")
+        await q.edit_message_text("MTProto обновлён")
 
-    if q.data == "wa_s":
-        s,a,n = stats("waproxy")
-        return await q.edit_message_text(f"WhatsApp\\n{s}\\n{a}\\n{n}")
+    elif q.data=="wa_s":
+        s,a,n=stats("waproxy")
+        await q.edit_message_text(f"WhatsApp\\nСтатус:{s}\\nАптайм:{a}\\nТрафик:{n}")
 
-    if q.data == "wa_l":
-        return await q.edit_message_text(wa_link())
+    elif q.data=="wa_l":
+        await q.edit_message_text(wa_link())
 
-    if q.data == "wa_r":
+    elif q.data=="wa_r":
         sh("docker restart waproxy")
-        return await q.edit_message_text("WhatsApp restarted")
+        await q.edit_message_text("WhatsApp перезапущен")
 
-    if q.data == "wa_u":
+    elif q.data=="wa_u":
         sh("docker pull facebook/whatsapp_proxy:latest && docker restart waproxy")
-        return await q.edit_message_text("WhatsApp updated")
+        await q.edit_message_text("WhatsApp обновлён")
 
-app = ApplicationBuilder().token(BOT_TOKEN).build()
-app.add_handler(CommandHandler("start", start))
+app=ApplicationBuilder().token(BOT_TOKEN).build()
+app.add_handler(CommandHandler("start",start))
 app.add_handler(CallbackQueryHandler(cb))
-Thread(target=monitor, daemon=True).start()
+Thread(target=monitor,daemon=True).start()
 app.run_polling()
-PY
-### ==========================================
+EOF
 
-### ================= SYSTEMD ================
-step "Registering systemd service"
-cat > "$SERVICE_FILE" <<EOF
+cat <<EOF >/etc/systemd/system/tg-proxy-bot.service
 [Unit]
 Description=Telegram Proxy Control Bot
 After=network.target docker.service
 
 [Service]
-ExecStart=/usr/bin/python3 ${BOT_DIR}/bot.py
+ExecStart=/usr/bin/python3 /opt/tg-proxy-bot/bot.py
 Restart=always
 
 [Install]
@@ -266,13 +222,12 @@ EOF
 systemctl daemon-reload
 systemctl enable tg-proxy-bot
 systemctl start tg-proxy-bot
-systemctl is-active tg-proxy-bot >/dev/null || die "Bot failed to start"
-### ==========================================
+systemctl is-active tg-proxy-bot
 
-echo
-echo "================ DONE ================"
-echo "MTProto port : ${MT_PORT}"
-echo "MTProto secret : ${MT_SECRET}"
-echo "WhatsApp port : 443"
-echo "Install log : ${LOG}"
-echo "====================================="
+echo "================================="
+echo "ГОТОВО"
+echo "MTProto порт: ${MT_PORT}"
+echo "WhatsApp порт: 443"
+echo "MTProto SECRET: ${MT_SECRET}"
+echo "Логи установки: ${LOG}"
+echo "================================="
